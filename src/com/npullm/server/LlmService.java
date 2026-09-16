@@ -30,6 +30,8 @@ public class LlmService extends Service {
     static final AtomicReference<String> LAST_ERROR = new AtomicReference<String>("");
 
     private NpuEngine engine;
+    private ShellEngine shellEngine;
+    private volatile boolean useShell = false;
     private ServerSocket server;
     private ExecutorService pool = Executors.newCachedThreadPool();
     private volatile boolean running;
@@ -94,8 +96,39 @@ public class LlmService extends Service {
     private void initEngine() {
         try {
             STATUS.set("loading model...");
-            engine = new NpuEngine();
             File files = getFilesDir();
+            // Prime the shell-namespace work dir (/data/local/tmp/npullm is
+            // world-writable; App can stage files there for `adb shell` runs).
+            File shellDir = new File("/data/local/tmp/npullm");
+            File shellDispatch = new File(shellDir, "dispatch");
+            File shellModel = new File(shellDir, "mt6991.litertlm");
+            File shellBin = new File(shellDir, "lm_shell");
+            ShellEngine se = null;
+            try {
+                if (shellDir.exists()) {
+                    copyFileAssetTo("model.litertlm", shellModel);
+                    shellDispatch.mkdirs();
+                    copyFileAssetTo("libLiteRtDispatch_MediaTek.so",
+                            new File(shellDispatch, "libLiteRtDispatch_MediaTek.so"));
+                    copyLibTo(shellDir, "liblitert-lm.so");
+                    copyLibTo(shellDir, "libc++_shared.so");
+                    copyLibTo(shellDir, "lm_shell");
+                    try { new ProcessBuilder("chmod", "755", shellBin.getAbsolutePath()).start().waitFor(); }
+                    catch (Exception ignored) {}
+                    se = new ShellEngine(shellDir, shellModel, shellDispatch, shellBin);
+                    if (!se.usable()) se = null;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "shell staging failed: " + e.getMessage());
+                se = null;
+            }
+            if (se != null) {
+                // Shell path primed. Whether App-namespace exec works is
+                // verified lazily per request (SELinux may still deny); the
+                // in-process engine below remains the fallback.
+                shellEngine = se;
+            }
+            engine = new NpuEngine();
             File model = new File(files, "model.litertlm");
             STATUS.set("copying model...");
             copyAsset("model.litertlm", model);
@@ -125,15 +158,53 @@ public class LlmService extends Service {
                         cacheDir.getAbsolutePath(), "", 1280);
                 backend = "cpu";
             }
-            STATUS.set("ready (" + backend + ")");
+            STATUS.set("ready (" + backend + (shellEngine != null ? "+shell" : "") + ")");
             engineReady = true;
-            Log.i(TAG, "engine ready backend=" + backend);
+            Log.i(TAG, "engine ready backend=" + backend + " shell=" + (shellEngine != null));
         } catch (Exception e) {
             Log.e(TAG, "boot failed", e);
             LAST_ERROR.set(String.valueOf(e.getMessage()));
             STATUS.set("error: " + e.getMessage());
             return;
         }
+    }
+
+    private String doGenerate(String prompt) throws RuntimeException {
+        // Prefer the shell-namespace engine (real NPU). Fall back to the
+        // in-process engine (CPU/XNNPACK) if shell exec is denied.
+        ShellEngine se = shellEngine;
+        if (se != null) {
+            String r = se.generate(prompt, 1280);
+            if (r != null) return r;
+            Log.w(TAG, "shell generate failed, fallback in-process: " + se.lastError());
+        }
+        String r = engine.nativeGenerate(prompt);
+        return r == null ? "" : r;
+    }
+
+    private void copyLibTo(File shellDir, String name) throws Exception {
+        // .so lives in lib/arm64-v8a (installed) or assets; prefer installed copy.
+        File dst = new File(shellDir, name);
+        if (name.equals("lm_shell")) {
+            // lm_shell is built on host; ship it as an asset.
+            copyFileAssetTo(name, dst);
+            return;
+        }
+        String abiPath = getApplicationInfo().nativeLibraryDir + "/" + name;
+        File src = new File(abiPath);
+        if (src.exists() && (!dst.exists() || dst.length() != src.length())) {
+            if (dst.exists()) dst.delete();
+            InputStream in = new java.io.FileInputStream(src);
+            OutputStream out = new FileOutputStream(dst);
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.close(); in.close();
+        }
+    }
+
+    private void copyFileAssetTo(String name, File dst) throws Exception {
+        copyAssetTo(name, dst);
     }
 
     private void copyAsset(String name, File dst) throws Exception {
@@ -212,7 +283,7 @@ public class LlmService extends Service {
                 boolean stream = bodyStr.contains("\"stream\"") && bodyStr.contains("true");
                 String reply;
                 try {
-                    reply = engine.nativeGenerate(prompt);
+                    reply = doGenerate(prompt);
                     if (reply == null) reply = "";
                 } catch (RuntimeException e) {
                     send(out, 500, "{\"error\":\"" + esc(String.valueOf(e.getMessage())) + "\"}");
@@ -235,7 +306,7 @@ public class LlmService extends Service {
                 if (!engineReady) { send(out, 503, "{\"error\":\"engine not ready: " + esc(STATUS.get()) + "\"}"); s.close(); return; }
                 String prompt = extractPrompt(bodyStr);
                 String reply;
-                try { reply = engine.nativeGenerate(prompt); if (reply == null) reply = ""; }
+                try { reply = doGenerate(prompt); if (reply == null) reply = ""; }
                 catch (RuntimeException e) { send(out, 500, "{\"error\":\"" + esc(String.valueOf(e.getMessage())) + "\"}"); s.close(); return; }
                 send(out, 200, "{\"id\":\"cmpl-npu\",\"object\":\"text_completion\",\"model\":\"npu-llm\",\"choices\":[{\"text\":\""
                         + esc(reply) + "\",\"index\":0,\"finish_reason\":\"stop\"}]}");
