@@ -51,7 +51,7 @@ static void (*p_session_cancel)(LiteRtLmSession*);
 static void* g_lm_handle = NULL;
 
 #define LOAD_SYM(var, name) do { \
-  p_##var = (void*)dlsym(g_lm_handle, name); \
+  *(void**)(&p_##var) = dlsym(g_lm_handle, name); \
   if (!p_##var) { LOGE("missing symbol %s", name); return 0; } \
 } while (0)
 
@@ -77,10 +77,8 @@ static int load_lm_lib(void) {
   LOAD_SYM(responses_num, "litert_lm_responses_get_num_candidates");
   LOAD_SYM(responses_text_at, "litert_lm_responses_get_response_text_at");
   // optional symbols (may be absent in some builds)
-  p_session_cancel = (void*)dlsym(g_lm_handle, "litert_lm_session_cancel_process");
-  p_session_config_set_max_output = (void*)dlsym(g_lm_handle, "litert_lm_session_config_set_max_output_tokens");
-  if (!p_session_config_set_max_output)
-    p_session_config_set_max_output = (void*)dlsym(g_lm_handle, "litert_lm_session_config_set_max_output_tokens");
+  *(void**)(&p_session_cancel) = dlsym(g_lm_handle, "litert_lm_session_cancel_process");
+  *(void**)(&p_session_config_set_max_output) = dlsym(g_lm_handle, "litert_lm_session_config_set_max_output_tokens");
   LOGI("liblitert-lm.so symbols loaded");
   return 1;
 }

@@ -61,44 +61,25 @@ public class LlmService extends Service {
         startForeground(1, b.build());
     }
 
+    private volatile boolean engineReady = false;
+
     private void bootAndServe() {
-        try {
-            STATUS.set("loading model...");
-            engine = new NpuEngine();
-            File files = getFilesDir();
-            File model = new File(files, "model.litertlm");
-            if (!model.exists()) {
-                STATUS.set("copying model...");
-                copyAsset("model.litertlm", model);
-            }
-            File dispatchDir = new File(files, "dispatch");
-            dispatchDir.mkdirs();
-            copyAssetTo("libLiteRtDispatch_MediaTek.so", new File(dispatchDir, "libLiteRtDispatch_MediaTek.so"));
-            File cacheDir = new File(getCacheDir(), "litertlm");
-            cacheDir.mkdirs();
-            // NPU first, fall back to CPU so the HTTP API is always usable.
-            try {
-                engine.nativeInit(model.getAbsolutePath(), "npu",
-                        cacheDir.getAbsolutePath(), dispatchDir.getAbsolutePath(), 1280);
-                backend = "npu";
-            } catch (RuntimeException e) {
-                Log.w(TAG, "npu init failed, fallback cpu: " + e.getMessage());
-                LAST_ERROR.set("npu init failed: " + e.getMessage());
-                engine.nativeInit(model.getAbsolutePath(), "cpu",
-                        cacheDir.getAbsolutePath(), "", 1280);
-                backend = "cpu";
-            }
-            STATUS.set("ready (" + backend + ")");
-            Log.i(TAG, "engine ready backend=" + backend);
-        } catch (Exception e) {
-            Log.e(TAG, "boot failed", e);
-            LAST_ERROR.set(String.valueOf(e.getMessage()));
-            STATUS.set("error: " + e.getMessage());
-            return;
-        }
+        // Bind the HTTP port FIRST so /health is always reachable, then
+        // init the (slow, fallible) engine on a worker thread.
         try {
             server = new ServerSocket(PORT);
             Log.i(TAG, "listening on " + PORT);
+        } catch (Exception e) {
+            Log.e(TAG, "bind failed", e);
+            STATUS.set("error: bind " + e.getMessage());
+            return;
+        }
+        Thread init = new Thread(new Runnable() {
+            @Override public void run() { initEngine(); }
+        });
+        init.setDaemon(true);
+        init.start();
+        try {
             while (running) {
                 final Socket s = server.accept();
                 pool.execute(new Runnable() {
@@ -110,12 +91,67 @@ public class LlmService extends Service {
         }
     }
 
+    private void initEngine() {
+        try {
+            STATUS.set("loading model...");
+            engine = new NpuEngine();
+            File files = getFilesDir();
+            File model = new File(files, "model.litertlm");
+            STATUS.set("copying model...");
+            copyAsset("model.litertlm", model);
+            File dispatchDir = new File(files, "dispatch");
+            dispatchDir.mkdirs();
+            copyAssetTo("libLiteRtDispatch_MediaTek.so", new File(dispatchDir, "libLiteRtDispatch_MediaTek.so"));
+            File cacheDir = new File(getCacheDir(), "litertlm");
+            cacheDir.mkdirs();
+            // NPU first, fall back to CPU so the HTTP API is always usable.
+            // NOTE: each nativeInit runs on the single native worker; a failed
+            // NPU init leaves no engine behind, so retrying with CPU is safe.
+            // A model compiled for a different SoC (e.g. mt6993 on mt6991)
+            // fails NPU init -> falls back to CPU only if the model has no
+            // NPU backend constraint. NPU-constrained models fail both.
+            boolean npuOk = false;
+            try {
+                engine.nativeInit(model.getAbsolutePath(), "npu",
+                        cacheDir.getAbsolutePath(), dispatchDir.getAbsolutePath(), 1280);
+                backend = "npu";
+                npuOk = true;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "npu init failed, fallback cpu: " + e.getMessage());
+                LAST_ERROR.set("npu init failed: " + e.getMessage());
+            }
+            if (!npuOk) {
+                engine.nativeInit(model.getAbsolutePath(), "cpu",
+                        cacheDir.getAbsolutePath(), "", 1280);
+                backend = "cpu";
+            }
+            STATUS.set("ready (" + backend + ")");
+            engineReady = true;
+            Log.i(TAG, "engine ready backend=" + backend);
+        } catch (Exception e) {
+            Log.e(TAG, "boot failed", e);
+            LAST_ERROR.set(String.valueOf(e.getMessage()));
+            STATUS.set("error: " + e.getMessage());
+            return;
+        }
+    }
+
     private void copyAsset(String name, File dst) throws Exception {
         copyAssetTo(name, dst);
     }
 
     private void copyAssetTo(String name, File dst) throws Exception {
-        if (dst.exists() && dst.length() > 0) return;
+        // Re-copy when the bundled asset differs (model updates must propagate;
+        // the old "exists => skip" check pinned a stale 1.1G mt6993 model).
+        long assetLen = -1;
+        try {
+            android.content.res.AssetFileDescriptor afd = getAssets().openFd(name);
+            assetLen = afd.getLength();
+            afd.close();
+        } catch (Exception ignored) {}
+        if (dst.exists() && assetLen > 0 && dst.length() == assetLen) return;
+        if (dst.exists()) dst.delete();
+        STATUS.set("copying " + name + "...");
         InputStream in = getAssets().open(name);
         OutputStream out = new FileOutputStream(dst);
         byte[] buf = new byte[65536];
@@ -171,6 +207,7 @@ public class LlmService extends Service {
                 send(out, 200, "{\"status\":\"" + esc(STATUS.get()) + "\",\"backend\":\"" + esc(backend)
                         + "\",\"error\":\"" + esc(LAST_ERROR.get()) + "\"}");
             } else if (method.equals("POST") && path.equals("/v1/chat/completions")) {
+                if (!engineReady) { send(out, 503, "{\"error\":\"engine not ready: " + esc(STATUS.get()) + "\"}"); s.close(); return; }
                 String prompt = extractPrompt(bodyStr);
                 boolean stream = bodyStr.contains("\"stream\"") && bodyStr.contains("true");
                 String reply;
@@ -195,6 +232,7 @@ public class LlmService extends Service {
                     send(out, 200, payload);
                 }
             } else if (method.equals("POST") && path.equals("/v1/completions")) {
+                if (!engineReady) { send(out, 503, "{\"error\":\"engine not ready: " + esc(STATUS.get()) + "\"}"); s.close(); return; }
                 String prompt = extractPrompt(bodyStr);
                 String reply;
                 try { reply = engine.nativeGenerate(prompt); if (reply == null) reply = ""; }
