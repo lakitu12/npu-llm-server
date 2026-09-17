@@ -68,7 +68,7 @@ jobs:
           "$RUNNER_TEMP/py/bin/python" - <<'PY'
           import ctypes
           so = ctypes.CDLL('bazel-bin/litert/vendors/mediatek/compiler/libLiteRtCompilerPlugin_MediaTek.so')
-          for sym in ('LiteRtCompilerPluginCreate',
+          for sym in ('LiteRtCreateCompilerPlugin',
                       'LiteRtCompiledResultNumByteCodeModules',
                       'LiteRtGetCompiledResultByteCode',
                       'LiteRtGetCompiledResultCallInfo'):
