@@ -216,6 +216,23 @@ def override_plugin(plugin_path):
     return str(d)
 
 
+def dissect_compiled(path, s, top=12):
+    """编译产物 buffer 账本: 谁贡献了体积 (回答 'bundle 为什么这么大')."""
+    root, mm = read_model(path, s)
+    try:
+        bufs = []
+        for i in range(root.BuffersLength()):
+            b = root.Buffers(i)
+            bufs.append({'i': i, 'bytes': b.Size()})
+        total = sum(x['bytes'] for x in bufs)
+        big = sorted(bufs, key=lambda x: -x['bytes'])[:top]
+        return {'file_bytes': path.stat().st_size, 'buffer_total': total,
+                'num_buffers': len(bufs), 'top_buffers': big,
+                'top_sum': sum(x['bytes'] for x in big)}
+    finally:
+        mm.close()
+
+
 def compile_sections(tflite, work, subgraphs=None):
     import glob
     from ai_edge_litert.aot.aot_compile import aot_compile
@@ -413,6 +430,11 @@ def main():
         cands = [o for e in report.get('compile', []) for o in e['outputs'] if o['bytes'] > 0]
         if cands:
             big = max(cands, key=lambda o: o['bytes'])
+            try:
+                report['compiled_dissection'] = dissect_compiled(
+                    pathlib.Path(big['path']), s)
+            except Exception as ex:
+                report['compiled_dissection'] = {'error': str(ex)[:300]}
             bundle = repack_and_verify(unpack_dir, big, work / 'out', args.variant)
             if args.subgraphs:
                 bundle['partial'] = True

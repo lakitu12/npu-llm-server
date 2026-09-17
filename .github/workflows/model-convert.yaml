@@ -200,6 +200,9 @@ jobs:
             b=$(basename "$f")
             (cd work/out && split -b 1900m "$b" "$b.part-")
           done
+          # verify_unpack is a 7.9GB duplicate of the section inside the bundle —
+          # it is round-trip *evidence*, not a deliverable; drop before upload.
+          rm -rf work/out/verify_unpack
           if [ "$found" = 1 ]; then
             (cd work/out && sha256sum *.litertlm *.part-* > SHA256SUMS.txt)
             echo "has_bundle=1" >> "$GITHUB_ENV"
