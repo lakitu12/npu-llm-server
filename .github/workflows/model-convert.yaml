@@ -1,0 +1,184 @@
+name: Model Convert (Spark -> MT6991 NPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Source bundle quantization'
+        type: choice
+        options: [int8, int4]
+        default: int8
+      fc_rewrite:
+        description: 'Apply per-tensor FC rewrite (squeeze + row-scale MUL)'
+        type: boolean
+        default: true
+      plugin_source:
+        description: 'Compiler plugin origin'
+        type: choice
+        options: [wheel, artifact]
+        default: wheel
+      plugin_run_id:
+        description: 'Run id providing plugin-build-artifacts (empty = latest successful)'
+        type: string
+        default: ''
+  push:
+    branches: [master, main]
+    paths:
+      - 'convert/**'
+
+concurrency:
+  group: model-convert-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      VARIANT: ${{ inputs.variant || 'int8' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add swap for compile headroom
+        continue-on-error: true
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo fallocate -l 28G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=28672 || true
+          sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile || true
+          free -h
+          df -h / | tail -1
+
+      - name: Install toolchain
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --upgrade pip
+          .venv/bin/pip install -q -r convert/ci-requirements.txt
+          .venv/bin/pip freeze | grep -Ei 'litert|flatbuffers|numpy' | tee toolchain-versions.txt
+
+      - name: Fetch model from Hugging Face
+        env:
+          REPO: litert-community/Spark-X2.5-4B
+          FILE: Spark-X2.5-4B_${{ (inputs.variant || 'int8') }}.litertlm
+        run: |
+          set -euo pipefail
+          mkdir -p model
+          curl -fsSL "https://huggingface.co/${REPO}/raw/main/litertlm_manifest.json" -o manifest.json
+          EXPECT=$(python3 - "$FILE" <<'PY'
+          import json, sys
+          d = json.load(open('manifest.json'))
+          v = next(v for v in d['variants'] if v['file'] == sys.argv[1])
+          print(v['sha256'], v['size_bytes'])
+          PY
+          )
+          read -r EXPECT_SHA EXPECT_SIZE <<<"$EXPECT"
+          echo "expect: $EXPECT_SHA ($EXPECT_SIZE bytes)"
+          URL="https://huggingface.co/${REPO}/resolve/main/${FILE}"
+          ok=0
+          for i in $(seq 1 40); do
+            curl -fL -C - -o model/input.litertlm "$URL" || true
+            if [ "$(stat -c%s model/input.litertlm 2>/dev/null || echo 0)" = "$EXPECT_SIZE" ]; then ok=1; break; fi
+            sleep 5
+          done
+          test "$ok" = 1 || { echo 'download incomplete'; exit 1; }
+          sha256sum model/input.litertlm | tee input.sha256
+          test "$(cut -d' ' -f1 input.sha256)" = "$EXPECT_SHA" || { echo 'SHA256 MISMATCH'; exit 1; }
+
+      - name: Fetch custom plugin artifact
+        if: ${{ inputs.plugin_source == 'artifact' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RID='${{ inputs.plugin_run_id }}'
+          if [ -z "$RID" ]; then
+            RID=$(gh run list --workflow=npu-plugin-build-verify.yaml --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          fi
+          test -n "$RID" || { echo 'no successful plugin run'; exit 1; }
+          echo "using plugin from run $RID"
+          gh run download "$RID" -n plugin-build-artifacts -D custom-plugin
+          SO=$(find custom-plugin -type f -name 'libLiteRtCompilerPlugin_MediaTek.so' | head -1)
+          test -n "$SO" || { echo 'plugin .so missing in artifact'; exit 1; }
+          echo "PLUGIN_PATH=$PWD/$SO" >> "$GITHUB_ENV"
+
+      - name: Run conversion
+        env:
+          FC_FLAG: ${{ (inputs.fc_rewrite && '--fc') || '' }}
+        run: |
+          set +e
+          ARGS="--input model/input.litertlm --workdir work --variant $VARIANT --rewrite squeeze $FC_FLAG"
+          if [ -n "${PLUGIN_PATH:-}" ]; then ARGS="$ARGS --plugin $PLUGIN_PATH"; fi
+          echo "ARGS: $ARGS"
+          .venv/bin/python convert/ci_convert.py $ARGS 2>&1 | tee convert.log
+          rc=${PIPESTATUS[0]}
+          echo "convert_rc=$rc" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Publish report to summary
+        if: always()
+        run: |
+          {
+            echo "## Model conversion ($VARIANT)"
+            if [ -f work/report.json ]; then
+              echo '```json'; cat work/report.json; echo '```'
+            else
+              echo 'no report.json produced (process died early; tail of log below)'
+              echo '```'; tail -c 2000 convert.log 2>/dev/null; echo '```'
+            fi
+            echo
+            echo '### env at exit'
+            free -h
+            df -h / | tail -1
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conversion-evidence-${{ inputs.variant || 'int8' }}
+          path: |
+            convert.log
+            work/report.json
+            work/rewrite/validation.json
+            work/aot/*/dla_manifest.json
+            input.sha256
+            toolchain-versions.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Package verified bundle (split >1.9G parts)
+        if: always()
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in work/out/*.litertlm; do
+            found=1
+            b=$(basename "$f")
+            (cd work/out && split -b 1900m "$b" "$b.part-")
+          done
+          if [ "$found" = 1 ]; then
+            (cd work/out && sha256sum *.litertlm *.part-* > SHA256SUMS.txt)
+            echo "has_bundle=1" >> "$GITHUB_ENV"
+          else
+            echo "has_bundle=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload bundle parts
+        if: env.has_bundle == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt6991-npu-bundle-${{ inputs.variant || 'int8' }}
+          path: work/out/**
+          retention-days: 14
+
+      - name: Gate
+        run: |
+          rc="${convert_rc:-1}"
+          if [ "$rc" != "0" ]; then
+            echo "::error::conversion rc=$rc (blocked/error) - evidence uploaded, see report"
+            exit "$rc"
+          fi
+          echo "compiled bundle produced and round-trip verified"

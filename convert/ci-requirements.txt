@@ -1,0 +1,6 @@
+# 与本机验证过的 /tmp/ltpk venv 完全一致的版本组合
+ai-edge-litert==2.2.0
+ai-edge-litert-sdk-mediatek==2.2.0
+litert-lm-builder==0.17.1
+flatbuffers==25.12.19
+numpy==2.5.3
