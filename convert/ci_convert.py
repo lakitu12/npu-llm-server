@@ -294,10 +294,15 @@ def repack_and_verify(unpack_dir, out_entry, out_dir, variant):
     if vdir.exists():
         shutil.rmtree(vdir)
     ltlm_unpack(str(out), str(vdir))
-    got = vdir / 'compiled_section.tflite'
-    ok = got.exists() and sha256_file(got) == out_entry['sha256']
+    # NOTE: unpack/peek 落盘名由 Section{N}_TFLiteModel_{model_type}.tflite 规则
+    # 生成, 不沿用 toml 的 data_path (上轮 round-trip 假阴性根因)。
+    cands = sorted(vdir.glob('Section*_TFLiteModel*.tflite'))
+    info = {'sections_back': len(list(vdir.iterdir()))}
+    ok = len(cands) == 1 and sha256_file(cands[0]) == out_entry['sha256']
+    info['dumped_name'] = cands[0].name if len(cands) == 1 else [p.name for p in cands]
     return {'path': str(out), 'bytes': out.stat().st_size, 'sha256': sha256_file(out),
-            'roundtrip_verified': bool(ok), 'source_compiled_sha256': out_entry['sha256']}
+            'roundtrip_verified': bool(ok), 'roundtrip_detail': info,
+            'source_compiled_sha256': out_entry['sha256']}
 
 
 EXPECTED = {'int8': {'squeeze': 7, 'fc': 1483}}
