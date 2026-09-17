@@ -190,21 +190,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Package verified bundle (split >1.9G parts)
+      - name: Package verified bundle
         if: always()
         run: |
           shopt -s nullglob
           found=0
+          # No split needed: artifact upload has no 2GB-per-file limit (7.9G
+          # single file proven uploaded OK in run 35230801213). split + full
+          # bundle together meant 2x duplicate bytes on the wire.
+          rm -rf work/out/verify_unpack
           for f in work/out/*.litertlm; do
             found=1
-            b=$(basename "$f")
-            (cd work/out && split -b 1900m "$b" "$b.part-")
+            (cd work/out && sha256sum "$f" > SHA256SUMS.txt)
           done
-          # verify_unpack is a 7.9GB duplicate of the section inside the bundle —
-          # it is round-trip *evidence*, not a deliverable; drop before upload.
-          rm -rf work/out/verify_unpack
           if [ "$found" = 1 ]; then
-            (cd work/out && sha256sum *.litertlm *.part-* > SHA256SUMS.txt)
             echo "has_bundle=1" >> "$GITHUB_ENV"
           else
             echo "has_bundle=0" >> "$GITHUB_ENV"
