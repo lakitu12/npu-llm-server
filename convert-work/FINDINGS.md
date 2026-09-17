@@ -326,3 +326,11 @@ CI 实测(run 35209055507 squeeze-only, 35209067686 squeeze+fc) 真实结论:
    而非各子图字节码; DLA字节码占比可能很小。待 compiled_dissection (commit 2a2806a) 实测归因。
 bundle 结构: 4.0G原权重arena(回退保留) + 3.5G增量(归因待定) + ~250M元数据。
 artifact 21GB = bundle+split+verify_unpack 三份重复, 已修 (rm verify_unpack)。
+
+
+--- 编译产物解剖 (run 35237603330, prefill_1024) ---
+file_bytes=7,921,020,540 buffer_total=4,112,656,384 num_buffers=631 (原429+新202)。
+Top buffer: #7=335MB, 其余26MB级。推断(待offset图实锤): buffer_total≈原权重arena(4.11G)全额;
+新增202个buffer在Size()账上≈0 => 3.8G未记账区域 = 导出时整段外部权重被二次复制, 与子图无关
+(prefill与decode产物仅差95KB, 而两图DLA差35x => 字节码本体只占百MB级)。
+验证法: 本地解剖下载bundle内的Section2 tflite offset图 (mmap+schema, 免CI)。
