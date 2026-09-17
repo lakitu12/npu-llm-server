@@ -49,6 +49,10 @@ jobs:
           sudo rm -f /swapfile || true
           sudo fallocate -l 28G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=28672 || true
           sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile || true
+          # ubuntu-24.04 runner ships systemd-oomd; it SIGTERMs whole process
+          # trees under memory pressure (suspected cause of rc=143 at 1080s).
+          sudo systemctl stop systemd-oomd.service 2>/dev/null || true
+          sudo systemctl status systemd-oomd --no-pager 2>&1 | head -4 || true
           free -h
           df -h / | tail -1
 
