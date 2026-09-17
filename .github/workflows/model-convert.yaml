@@ -199,10 +199,11 @@ jobs:
           # single file proven uploaded OK in run 35230801213). split + full
           # bundle together meant 2x duplicate bytes on the wire.
           rm -rf work/out/verify_unpack
-          for f in work/out/*.litertlm; do
+          shopt -s nullglob
+          ( cd work/out && sha256sum ./**/*.litertlm ./*.litertlm 2>/dev/null | sort -u > SHA256SUMS.txt ) || true
+          if find work/out -name '*.litertlm' -type f | grep -q .; then
             found=1
-            (cd work/out && sha256sum "$f" > SHA256SUMS.txt)
-          done
+          fi
           if [ "$found" = 1 ]; then
             echo "has_bundle=1" >> "$GITHUB_ENV"
           else
