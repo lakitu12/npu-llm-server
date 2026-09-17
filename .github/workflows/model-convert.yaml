@@ -21,10 +21,14 @@ on:
         description: 'Run id providing plugin-build-artifacts (empty = latest successful)'
         type: string
         default: ''
-  push:
-    branches: [master, main]
-    paths:
-      - 'convert/**'
+      subgraphs:
+        description: 'Subgraph indices to compile, e.g. "0" (empty = all 7; full compile needs >40GB, runner will die)'
+        type: string
+        default: ''
+  # push trigger removed deliberately: full 7-subgraph compile peaks >40GB
+  # (RSS 15G + swap 27G, both exhausted -> runner killed the step). Auto-runs
+  # on every convert/** push just burned a machine to reproduce known death.
+  # Trigger manually and set subgraphs (e.g. "0" or "0,2") to fit the runner.
 
 concurrency:
   group: model-convert-${{ github.ref }}
@@ -127,6 +131,8 @@ jobs:
           setsid bash convert/ci_memmon.sh > mem.log 2>&1 < /dev/null &
           MON=$!
           ARGS="--input model/input.litertlm --workdir work --variant $VARIANT --rewrite squeeze $FC_FLAG"
+          SG='${{ inputs.subgraphs }}'
+          if [ -n "$SG" ]; then ARGS="$ARGS --subgraphs $SG"; fi
           if [ -n "${PLUGIN_PATH:-}" ]; then ARGS="$ARGS --plugin $PLUGIN_PATH"; fi
           echo "ARGS: $ARGS"
           setsid bash -c ".venv/bin/python convert/ci_convert.py $ARGS > convert.log 2>&1; echo \$? > convert.rc" < /dev/null &

@@ -216,22 +216,26 @@ def override_plugin(plugin_path):
     return str(d)
 
 
-def compile_sections(tflite, work):
+def compile_sections(tflite, work, subgraphs=None):
     import glob
     from ai_edge_litert.aot.aot_compile import aot_compile
     from ai_edge_litert.aot.vendors.mediatek.target import Target, SocModel, SocManufacturer
     outdir = work / 'aot' / tflite.stem
+    if subgraphs:
+        outdir = work / 'aot' / (tflite.stem + '_sg' + '-'.join(map(str, subgraphs)))
     outdir.mkdir(parents=True, exist_ok=True)
     dla = outdir / 'dla'
     dla.mkdir(parents=True, exist_ok=True)  # 插件要求目录已存在, 否则报 not a valid directory 且不落 DLA
     os.environ['MTKNN_ADAPTER_DLA_DIR'] = str(dla)
-    entry = {'section': tflite.name, 'dla_dir': str(dla), 'target': 'MT6991(neuron v8)'}
+    entry = {'section': tflite.name, 'dla_dir': str(dla), 'target': 'MT6991(neuron v8)',
+             'subgraphs_to_compile': subgraphs}
     t0 = time.time()
     err_before = set(glob.glob('/tmp/*.error'))
     try:
         aot_compile(str(tflite), output_dir=str(outdir),
                     target=Target(SocModel.MT6991, SocManufacturer.MEDIATEK),
-                    backend_id='mediatek', keep_going=True)
+                    backend_id='mediatek', keep_going=True,
+                    subgraphs_to_compile=subgraphs)
         entry['compile_error'] = None
     except Exception as e:
         import traceback
@@ -310,6 +314,9 @@ def main():
     ap.add_argument('--skip-compile', action='store_true')
     ap.add_argument('--no-expect', action='store_true',
                     help='跳过 squeeze/FC 预期数量断言 (冒烟测试用)')
+    ap.add_argument('--subgraphs', default=None,
+                    help='逗号分隔子图索引(如 0): 只编这些子图压内存峰值; '
+                         '产物为部分编译, 不做bundle重打包')
     args = ap.parse_args()
 
     work = pathlib.Path(args.workdir).resolve()
@@ -394,13 +401,17 @@ def main():
         if args.skip_compile:
             report['compile'] = []
         else:
-            log('[4/4] AOT compile ...')
-            report['compile'] = compile_sections(model_for_compile, work)
+            subs = [int(x) for x in args.subgraphs.split(',')] if args.subgraphs else None
+            log(f'[4/4] AOT compile ... subgraphs={subs or "all"}')
+            report['compile'] = compile_sections(model_for_compile, work, subgraphs=subs)
 
         cands = [o for e in report.get('compile', []) for o in e['outputs'] if o['bytes'] > 0]
         if cands:
             big = max(cands, key=lambda o: o['bytes'])
             bundle = repack_and_verify(unpack_dir, big, work / 'out', args.variant)
+            if args.subgraphs:
+                bundle['partial'] = True
+                bundle['note'] = f'仅子图 {args.subgraphs} 编译; 整bundle其余部分仍为CPU版'
             report['bundle'] = bundle
             if bundle.get('roundtrip_verified'):
                 report['status'] = 'compiled_bundle_verified'
