@@ -1,0 +1,76 @@
+name: Build and Verify NPU Plugin
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'build.sh'
+      - 'AndroidManifest.xml'
+      - 'src/**'
+      - 'jni/**'
+      - 'lib/**'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'build.sh'
+      - 'AndroidManifest.xml'
+      - 'src/**'
+      - 'jni/**'
+      - 'lib/**'
+
+jobs:
+  build-plugin:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Bazelisk
+        run: |
+          curl -fsSL -o /usr/local/bin/bazelisk https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64
+          chmod +x /usr/local/bin/bazelisk
+          echo "/usr/local/bin" >> $GITHUB_PATH
+      - name: Setup build environment
+        run: |
+          apt-get update && apt-get install -y python3 python3-pip openjdk-17-jdk curl git
+          export USE_BAZEL_VERSION=7.7.0
+          echo "USE_BAZEL_VERSION=7.7.0" >> $GITHUB_ENV
+      - name: Build plugin (verified command from local success)
+        run: |
+          export PATH=/usr/local/bin:$PATH
+          export USE_BAZEL_VERSION=7.7.0
+          bazelisk build //litert/vendors/mediatek/compiler:all --jobs=8 --verbose_failures
+        timeout-minutes: 30
+      - name: Verify build artifacts exist
+        run: |
+          ls -la bazel-bin/litert/vendors/mediatek/compiler/libLiteRtCompilerPlugin_MediaTek.so || exit 1
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-build-artifacts
+          path: bazel-bin/litert/vendors/mediatek/compiler/
+          retention-days: 7
+
+  runtime-verify:
+    needs: build-plugin
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-build-artifacts
+          path: artifacts
+      - name: Setup LiteRT SDK and test environment (placeholder for runtime verification)
+        run: |
+          echo "Runtime verification requires MTK Neuron SDK (libmvpuop25_mtk_nn.so, libmvpuop25_mtk_cv.so, libmvpu_runtime_25_pub.so) and OpenCL setup."
+          echo "Placeholder: verify multi-module output format (bytebuilders > 1) after runtime setup."
+          # Actual verification: apply plugin with --subgraphs=0 and verify compiled.tflite > 0 bytes
+      - name: Check build status
+        run: |
+          echo "Build completed successfully. Runtime verification pending runtime library installation."
+          echo "See FINDINGS.md for current real-state: build verified, runtime blocked (missing libraries + disk space limits locally verified)."
