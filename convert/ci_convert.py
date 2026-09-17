@@ -217,6 +217,7 @@ def override_plugin(plugin_path):
 
 
 def compile_sections(tflite, work):
+    import glob
     from ai_edge_litert.aot.aot_compile import aot_compile
     from ai_edge_litert.aot.vendors.mediatek.target import Target, SocModel, SocManufacturer
     outdir = work / 'aot' / tflite.stem
@@ -225,6 +226,7 @@ def compile_sections(tflite, work):
     os.environ['MTKNN_ADAPTER_DLA_DIR'] = str(dla)
     entry = {'section': tflite.name, 'dla_dir': str(dla), 'target': 'MT6991(neuron v8)'}
     t0 = time.time()
+    err_before = set(glob.glob('/tmp/*.error'))
     try:
         aot_compile(str(tflite), output_dir=str(outdir),
                     target=Target(SocModel.MT6991, SocManufacturer.MEDIATEK),
@@ -234,6 +236,18 @@ def compile_sections(tflite, work):
         import traceback
         entry['compile_error'] = ''.join(
             traceback.format_exception(type(e), e, e.__traceback__))[-3000:]
+    # apply_plugin(experimental_capture_stderr) 把插件真实报错写到 /tmp/<tmp>.error;
+    # 抓取新增的, 否则 runner 一退证据就没了.
+    new_errs = sorted(set(glob.glob('/tmp/*.error')) - err_before)
+    blob = []
+    for p in new_errs:
+        try:
+            blob.append(f'=== {os.path.basename(p)} ===\n' +
+                        pathlib.Path(p).read_text(errors='replace')[-4000:])
+        except OSError:
+            pass
+    if blob:
+        entry['apply_plugin_stderr'] = '\n'.join(blob)[-8000:]
     entry['seconds'] = round(time.time() - t0, 1)
     entry['outputs'] = []
     for p in sorted(outdir.rglob('*.tflite')):
