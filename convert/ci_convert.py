@@ -223,6 +223,7 @@ def compile_sections(tflite, work):
     outdir = work / 'aot' / tflite.stem
     outdir.mkdir(parents=True, exist_ok=True)
     dla = outdir / 'dla'
+    dla.mkdir(parents=True, exist_ok=True)  # 插件要求目录已存在, 否则报 not a valid directory 且不落 DLA
     os.environ['MTKNN_ADAPTER_DLA_DIR'] = str(dla)
     entry = {'section': tflite.name, 'dla_dir': str(dla), 'target': 'MT6991(neuron v8)'}
     t0 = time.time()
