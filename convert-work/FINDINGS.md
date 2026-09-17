@@ -315,3 +315,14 @@ CI 实测(run 35209055507 squeeze-only, 35209067686 squeeze+fc) 真实结论:
   已在 workflow 停掉 systemd-oomd 重跑 (run 35217879590)。
 - 流程教训: step 被平台 SIGKILL/SIGTERM 时, 即使 if: always() 的下游步也可能被整步跳过
   (本次 report 都没上传) => 以后被 143/137 杀掉 = 证据全丢, 只留日志时间戳判生死。
+
+
+--- 双子图 CI 编译成功 + 体积谜团 (2026-09-17 晚, run 35227809795/35230801213/35233345249) ---
+实测 (compiled_bundle_verified, roundtrip sha256 通过):
+- subgraph0 (prefill_1024): 编译 116s, 产物 7,921,020,540 B, RSS峰~15G, 无击杀。
+- subgraph6 (decode): 编译 295s, 产物 7,920,924,748 B, 无击杀。本地5G墙下从未完成的图, CI打通。
+反常线索: 两产物仅差 95,792 B, 但两图 DLA 总量差 ~35x (subgraph0 dla_retry=186M, decode dla=3.78G/41对)。
+=> 3.5G 增量与"编哪张图"几乎无关 => 强烈怀疑是共享 external weight arena 被整体复制第二份,
+   而非各子图字节码; DLA字节码占比可能很小。待 compiled_dissection (commit 2a2806a) 实测归因。
+bundle 结构: 4.0G原权重arena(回退保留) + 3.5G增量(归因待定) + ~250M元数据。
+artifact 21GB = bundle+split+verify_unpack 三份重复, 已修 (rm verify_unpack)。
