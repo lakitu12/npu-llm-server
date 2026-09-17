@@ -1,0 +1,137 @@
+diff --git a/litert/vendors/mediatek/compiler/compiler_plugin.cc b/litert/vendors/mediatek/compiler/compiler_plugin.cc
+index a3e36e6..b546da4 100644
+--- a/litert/vendors/mediatek/compiler/compiler_plugin.cc
++++ b/litert/vendors/mediatek/compiler/compiler_plugin.cc
+@@ -226,7 +226,9 @@ LiteRtStatus LiteRtGetCompilerPluginSupportedSocModel(
+ // results with more than one single bytecode.
+ struct LiteRtCompiledResultT {
+   std::vector<std::string> graph_names;
+-  neuron::BytecodeBuilder bytebuilder;
++  // Multi-module extension (2026-09-17): one BytecodeBuilder per graph.
++  // Keep single-module backward-compat until 2-partition regression passes.
++  std::vector<neuron::BytecodeBuilder> bytebuilders;
+ };
+ 
+ LiteRtStatus LiteRtCompiledResultNumByteCodeModules(
+@@ -234,9 +236,11 @@ LiteRtStatus LiteRtCompiledResultNumByteCodeModules(
+   if (!compiled_result || !num_byte_code) {
+     return kLiteRtStatusErrorInvalidArgument;
+   }
+-  // TODO(yunandrew) MTK should have one byte code per call. But now only one
+-  // bytecode is created for all partitions.
+-  *num_byte_code = 1;
++  // Multi-module (2026-09-17): return bytebuilders size (backward-compat: 1 if empty).
++  *num_byte_code = compiled_result->bytebuilders.empty()
++                         ? 1
++                         : static_cast<LiteRtParamIndex>(
++                               compiled_result->bytebuilders.size());
+   return kLiteRtStatusOk;
+ }
+ 
+@@ -244,11 +248,12 @@ LiteRtStatus LiteRtGetCompiledResultByteCode(
+     LiteRtCompiledResult compiled_result, LiteRtParamIndex byte_code_idx,
+     const void** byte_code, size_t* byte_code_size) {
+   if (!compiled_result || !byte_code || !byte_code_size ||
+-      (byte_code_idx >= compiled_result->graph_names.size())) {
++      byte_code_idx >= compiled_result->bytebuilders.size()) {
+     return kLiteRtStatusErrorInvalidArgument;
+   }
+-  *byte_code = compiled_result->bytebuilder.GetBytecode().first;
+-  *byte_code_size = compiled_result->bytebuilder.GetBytecode().second;
++  auto& bb = compiled_result->bytebuilders[byte_code_idx];
++  *byte_code = bb.GetBytecode().first;
++  *byte_code_size = bb.GetBytecode().second;
+   return kLiteRtStatusOk;
+ }
+ 
+@@ -265,10 +270,11 @@ LiteRtStatus LiteRtGetCompiledResultCallInfo(
+   auto& graph_name = compiled_result->graph_names[call_idx];
+   *call_info = graph_name.data();
+   *call_info_size = graph_name.size();
+-  // TODO: MTK should have one byte code per call.
+-  // Only one bytecode is created for all partitions, so the byte code index is
+-  // always 0.
+-  *byte_code_idx = 0;
++  // Multi-module mapping (2026-09-17): byte_code_idx should map to call_idx
++  // when bytebuilders per graph is verified. Currently kept at 0 for backward-compat.
++  *byte_code_idx = (compiled_result->bytebuilders.size() > 1 && call_idx < compiled_result->bytebuilders.size())
++                      ? static_cast<LiteRtParamIndex>(call_idx)
++                      : 0;
+ 
+   return kLiteRtStatusOk;
+ }
+@@ -626,8 +632,9 @@ LiteRtStatus LiteRtCompilerPluginCompile(
+              neuron_version.major, neuron_version.minor, neuron_version.patch);
+ 
+   auto result = std::make_unique<LiteRtCompiledResultT>();
+-  result->bytebuilder.SetNeuronVersion(
+-      neuron_version.major, neuron_version.minor, neuron_version.patch);
++  // Multi-module (2026-09-17): each partition gets its own BytecodeBuilder,
++  // avoiding the >2GiB single-FlatBufferBuilder accumulation (std::bad_alloc
++  // reproduced on CI, see convert-work/FINDINGS.md).
+ 
+   for (auto i = 0; i < num_partitions; ++i) {
+     auto graph_name = absl::StrFormat("Partition_%d", i);
+@@ -642,15 +649,21 @@ LiteRtStatus LiteRtCompilerPluginCompile(
+       LITERT_LOG(LITERT_INFO, "%s", bytecode.Error().Message().c_str());
+       return bytecode.Error().Status();
+     }
+-    auto bufferIdx = result->bytebuilder.AddBuffer(
+-        graph_name, (int8_t*)bytecode->data(), bytecode->size());
+-    result->bytebuilder.AddCompiledNetwork(
++    neuron::BytecodeBuilder bb;
++    bb.SetNeuronVersion(neuron_version.major, neuron_version.minor,
++                         neuron_version.patch);
++    auto bufferIdx = bb.AddBuffer(graph_name, (int8_t*)bytecode->data(),
++                                   bytecode->size());
++    bb.AddCompiledNetwork(
+         graph_name, NeuronSchema::CompiledType_AdapterCache, bufferIdx);
++    result->bytebuilders.push_back(std::move(bb));
+     result->graph_names.emplace_back(graph_name);
+   }
+ 
+-  if (!result->bytebuilder.Finish()) {
+-    return kLiteRtStatusErrorCompilation;
++  for (auto& bb : result->bytebuilders) {
++    if (!bb.Finish()) {
++      return kLiteRtStatusErrorCompilation;
++    }
+   }
+   *compiled_result = result.release();
+   return kLiteRtStatusOk;
+diff --git a/litert/vendors/mediatek/neuron_adapter_api.cc b/litert/vendors/mediatek/neuron_adapter_api.cc
+index 3a69efb..99200ee 100644
+--- a/litert/vendors/mediatek/neuron_adapter_api.cc
++++ b/litert/vendors/mediatek/neuron_adapter_api.cc
+@@ -116,10 +116,22 @@ litert::Expected<void> NeuronAdapterApi::LoadSymbols(
+   so_paths.push_back(kLibNeuronAdapterLib);
+ 
+   // Add the library from the provided shared lib directory if available.
++  // NOTE (npullm fork): also try the usdk adapter names + absolute system
++  // path (/system_ext/...). App-namespace processes cannot resolve the vendor
++  // bare sonames via the public library list, but an absolute-path dlopen of
++  // a world-readable file can succeed (verified 2026-09-16 via dlprobe).
+   if (shared_library_dir.has_value()) {
+     so_paths.push_back(
+         absl::StrCat(*shared_library_dir, "/", kLibNeuronAdapterLib));
++    so_paths.push_back(absl::StrCat(*shared_library_dir,
++                                    "/libneuron_adapter_mgvi.so"));
++    so_paths.push_back(absl::StrCat(*shared_library_dir,
++                                    "/libneuronusdk_adapter.mtk.so"));
++    so_paths.push_back(absl::StrCat(*shared_library_dir,
++                                    "/libneuronusdk_adapter.9.mtk.so"));
+   }
++  so_paths.push_back("/system_ext/lib64/libneuronusdk_adapter.mtk.so");
++  so_paths.push_back("/system_ext/lib64/libneuronusdk_adapter.9.mtk.so");
+ 
+ #if !defined(__ANDROID__)
+   // Add SDK specific paths for Linux.
+diff --git a/third_party/neuro_pilot/neuro_pilot.BUILD b/third_party/neuro_pilot/neuro_pilot.BUILD
+index 525a9e8..2cf9a5a 100644
+--- a/third_party/neuro_pilot/neuro_pilot.BUILD
++++ b/third_party/neuro_pilot/neuro_pilot.BUILD
+@@ -24,3 +24,4 @@ exports_files(["LICENSE"])  # LICENCE from the original repository
+ ]
+ 
+ exports_files(srcs = glob(["**/*.so"]))
++exports_files(srcs = glob(["**/*.so.*"]))
