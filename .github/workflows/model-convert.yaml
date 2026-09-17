@@ -113,12 +113,28 @@ jobs:
           FC_FLAG: ${{ (inputs.fc_rewrite && '--fc') || '' }}
         run: |
           set +e
+          # Forensics: rc=143 (SIGTERM) suspected kernel OOM kill (no oomd on runner).
+          # Sample system mem, cgroup limit, and the python tree RSS every 5s.
+          ( while :; do
+              ts=$(date -u +%H:%M:%S)
+              mem=$(free -m | awk '/^Mem:/{print $3"/"$2"Mi swap_used=" $4}')
+              cg=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo NA)
+              cur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo NA)
+              rss=$(ps -eo rss,comm | awk '/python|apply_plugin/ {s+=$1} END {print s+0}')
+              echo "$ts MEM=$mem CGMAX=$cg CGCUR=$cur TREERSS_KB=$rss"
+              sleep 5
+            done ) > mem.log 2>&1 &
+          MON=$!
           ARGS="--input model/input.litertlm --workdir work --variant $VARIANT --rewrite squeeze $FC_FLAG"
           if [ -n "${PLUGIN_PATH:-}" ]; then ARGS="$ARGS --plugin $PLUGIN_PATH"; fi
           echo "ARGS: $ARGS"
           .venv/bin/python convert/ci_convert.py $ARGS 2>&1 | tee convert.log
           rc=${PIPESTATUS[0]}
-          echo "convert_rc=$rc" >> "$GITHUB_ENV"
+          kill $MON 2>/dev/null
+          echo "convert_rc=$rc (143=SIGTERM, 137=SIGKILL/OOM)" >> "$GITHUB_ENV"
+          echo "=== mem monitor tail ==="; tail -30 mem.log
+          { dmesg 2>/dev/null | tail -50; journalctl -k --no-pager -n 100 2>/dev/null; } > oom-evidence.log || true
+          grep -iE "kill|oom" oom-evidence.log | tail -20 || true
           exit 0
 
       - name: Publish report to summary
@@ -145,6 +161,8 @@ jobs:
           name: conversion-evidence-${{ inputs.variant || 'int8' }}
           path: |
             convert.log
+            mem.log
+            oom-evidence.log
             work/report.json
             work/rewrite/validation.json
             work/aot/*/dla_manifest.json
