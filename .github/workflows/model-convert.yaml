@@ -124,28 +124,22 @@ jobs:
           # No systemd-oomd on runner; kernel OOM would SIGKILL(137) not TERM(143).
           # Suspect cgroup/agent-level kill. Detach python + monitor via setsid so the
           # step can be killed without losing the run; tee monitor + dmesg to console.
-          setsid bash -c '
-            while :; do
-              rss=$(ps -eo rss,args | grep -E "ci_convert|apply_plugin" | grep -v grep | awk "{s+=\$1} END {print s+0}")
-              echo "$(date -u +%H:%M:%S) mem=$(awk "/MemUsed/{print int(\$2/1024)}M" /proc/meminfo) swap=$(awk "/SwapTotal/{t=\$2}/SwapFree/{f=\$2}END{print int((t-f)/1024)}M" /proc/meminfo) TREERSS_KB=$rss CG=$(cat /sys/fs/cgroup/memory.current 2>/dev/null) CGSWAP=$(cat /sys/fs/cgroup/memory.swap.current 2>/dev/null)"
-              sleep 5
-            done' > mem.log 2>&1 < /dev/null &
+          setsid bash convert/ci_memmon.sh > mem.log 2>&1 < /dev/null &
           MON=$!
           ARGS="--input model/input.litertlm --workdir work --variant $VARIANT --rewrite squeeze $FC_FLAG"
           if [ -n "${PLUGIN_PATH:-}" ]; then ARGS="$ARGS --plugin $PLUGIN_PATH"; fi
           echo "ARGS: $ARGS"
-          setsid .venv/bin/python convert/ci_convert.py $ARGS > convert.log 2>&1 < /dev/null &
+          setsid bash -c ".venv/bin/python convert/ci_convert.py $ARGS > convert.log 2>&1; echo \$? > convert.rc" < /dev/null &
           PYJ=$!
           sleep 3
-          # raise python above the step (its children inherit); if the killer is the
-          # kernel OOM victim-selection, -900 makes it an unlikely target and
-          # surviving-then-dying anyway distinguishes the mechanisms
-          echo -900 | sudo tee /proc/$PYJ/oom_score_adj >/dev/null 2>&1 || echo "oom_score_adj set failed"
-          while kill -0 $PYJ 2>/dev/null; do sleep 20; done
-          wait $PYJ 2>/dev/null; rc=$?
-          echo "python_wait_rc=$rc (137=SIGKILL/OOM, 143=SIGTERM, 2=blocked, 0=ok)"
+          echo "oom_score_adj: $(cat /proc/$PYJ/oom_score_adj 2>/dev/null)"
+          while kill -0 $PYJ 2>/dev/null; do
+            sleep 15
+            echo "LIVE $(date -u +%H:%M:%S) | mem: $(tail -1 mem.log 2>/dev/null) | cvt: $(tail -1 convert.log 2>/dev/null | tr -d '\r' | cut -c1-90)"
+          done
+          wait $PYJ 2>/dev/null; rc=$(cat convert.rc 2>/dev/null || echo 99)
           kill $MON 2>/dev/null
-          echo "$rc" > convert.rc
+          echo "python exit rc=$rc (137=SIGKILL, 143=SIGTERM, 2=blocked, 0=ok)"
           echo "convert_rc=$rc" >> "$GITHUB_ENV"
           echo "=== console forensics ==="
           echo "--- convert.log tail ---"; tail -30 convert.log
